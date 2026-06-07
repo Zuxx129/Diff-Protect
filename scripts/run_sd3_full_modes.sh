@@ -10,6 +10,7 @@ MAX_EXP_NUM="${3:-5}"
 
 python scripts/collect_sd3_data.py \
   --stop-on-fail \
+  --skip-existing \
   --modes O_repo,O_fair,A,B,C,D \
   --epsilons 4,8,16 \
   --steps 20,50 \
@@ -34,6 +35,16 @@ python code/metrics/aggregate_sd3_results.py \
   --metrics out_sd3/full_metrics.csv \
   --group-by mode,epsilon,steps,sigma \
   --out out_sd3/full_summary.csv
+
+python code/metrics/compute_fid_kid.py \
+  --root out_sd3 \
+  --out out_sd3/full_fid_kid.json \
+  --device "$DEVICE" || true
+
+python code/metrics/plot_sd3_paper_figures.py \
+  --metrics out_sd3/full_metrics.csv \
+  --summary out_sd3/full_summary.csv \
+  --out-dir out_sd3/paper_figures || true
 
 python code/plot_loss.py \
   --root out_sd3 \
