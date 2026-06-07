@@ -15,6 +15,7 @@ class AttentionMapHook:
     def __init__(self):
         self.attn_maps = []  # image-query -> text-key attention blocks, not full NxN maps
         self.attn_entropy_terms = []
+        self.txt_injection_feats = []  # A_{I->T} V_T, shape [B,H,N_img,Dh]
         self.hidden_states_list = []
         self.encoder_hidden_states_list = []
         self.img_stream_feats = []
@@ -24,6 +25,7 @@ class AttentionMapHook:
     def clear(self):
         self.attn_maps = []
         self.attn_entropy_terms = []
+        self.txt_injection_feats = []
         self.hidden_states_list = []
         self.encoder_hidden_states_list = []
         self.img_stream_feats = []
@@ -39,8 +41,8 @@ class AttnMapCaptureProcessor:
     """Custom attention processor for MMDiT Joint Attention.
 
     The real scaled-dot-product attention path is unchanged. For Mode A this
-    additionally computes a differentiable image-query -> text-key attention
-    block. Full [B,H,N,N] maps are intentionally not stored.
+    additionally computes differentiable image-query -> text-key attention and
+    the text-injection output A_{I->T}V_T.
     """
 
     def __init__(self, hook: AttentionMapHook, block_idx: int, capture_attn: bool = True):
@@ -106,7 +108,9 @@ class AttnMapCaptureProcessor:
                     query.float(), encoder_hidden_states_key_proj.float().transpose(-2, -1)
                 ) / math.sqrt(head_dim)
                 img_to_txt_attn = F.softmax(attn_scores, dim=-1).to(query.dtype)
+                txt_injection = torch.matmul(img_to_txt_attn, encoder_hidden_states_value_proj)
                 self.hook.attn_maps.append(img_to_txt_attn)
+                self.hook.txt_injection_feats.append(txt_injection)
                 entropy = -(
                     img_to_txt_attn * img_to_txt_attn.clamp_min(1e-8).log()
                 ).sum(dim=-1).mean()
@@ -207,34 +211,47 @@ def _tensor_item(x):
     return float(x)
 
 
-def _zero_on(device, dtype=torch.float32):
-    return torch.tensor(0.0, device=device, dtype=dtype)
+def cross_modal_disruption_loss(attn_maps, injection_adv=None, injection_clean=None, return_diagnostics=False):
+    """Loss A: cross-modal text injection disruption.
 
-
-def cross_modal_disruption_loss(attn_maps, N_img_tokens=None, return_diagnostics=False):
-    """Loss A: cross-modal attention entropy proxy.
-
-    Larger value means more diffuse image-query -> text-key attention. This is a
-    proxy for text injection disruption; full O_{I<-T} divergence is left as a
-    future extension.
+    Primary objective: maximize clean/adv difference of text-injection outputs
+    O_{I<-T}=A_{I->T}V_T when a clean reference is supplied.
+    Fallback objective: maximize image-query -> text-key attention entropy.
     """
     if len(attn_maps) == 0:
         loss = torch.tensor(0.0)
-        return (loss, {'attn_entropy': 0.0}) if return_diagnostics else loss
+        diag = {'attn_entropy': 0.0, 'attn_injection_l2': 0.0}
+        return (loss, diag) if return_diagnostics else loss
 
-    total_loss = None
-    count = 0
+    entropies = []
     for attn_block in attn_maps:
-        if N_img_tokens is not None and attn_block.shape[-1] == attn_block.shape[-2]:
-            text_attn = attn_block[:, :, :N_img_tokens, N_img_tokens:]
-        else:
-            text_attn = attn_block
-        entropy = -(text_attn * text_attn.clamp_min(1e-8).log()).sum(dim=-1).mean()
-        total_loss = entropy if total_loss is None else total_loss + entropy
-        count += 1
+        entropy = -(attn_block * attn_block.clamp_min(1e-8).log()).sum(dim=-1).mean()
+        entropies.append(entropy)
+    entropy_loss = torch.stack(entropies).mean()
 
-    loss = total_loss / max(count, 1)
-    diag = {'attn_entropy': _tensor_item(loss)}
+    injection_loss = None
+    if injection_adv is not None and injection_clean is not None and len(injection_adv) > 0:
+        terms = []
+        for adv, clean in zip(injection_adv, injection_clean):
+            adv_f = adv.float()
+            clean_f = clean.float().detach()
+            denom = clean_f.pow(2).mean().detach().clamp_min(1e-6)
+            terms.append(F.mse_loss(adv_f, clean_f) / denom)
+        if terms:
+            injection_loss = torch.stack(terms).mean()
+
+    if injection_loss is None:
+        loss = entropy_loss
+        injection_value = 0.0
+    else:
+        # Entropy is a small regularizer; injection divergence is the main target.
+        loss = injection_loss + 0.05 * entropy_loss
+        injection_value = _tensor_item(injection_loss)
+
+    diag = {
+        'attn_entropy': _tensor_item(entropy_loss),
+        'attn_injection_l2': injection_value,
+    }
     return (loss, diag) if return_diagnostics else loss
 
 
@@ -305,46 +322,70 @@ def trajectory_divergence_loss(v_adv, v_clean, return_diagnostics=False):
     return (loss, diag) if return_diagnostics else loss
 
 
-def modality_imbalance_loss(img_stream_feats, txt_stream_feats, return_diagnostics=False):
-    """Loss D: modality imbalance proxy.
+def _channel_cov(x):
+    x = _normalize_feature(x).float()
+    return torch.bmm(x.transpose(1, 2), x) / max(x.shape[1], 1)
 
-    Larger value encourages larger image-stream variance and lower image/text
-    correlation. This is a proxy, not the full energy-ratio/CKA objective.
+
+def _cov_cka(cov_a, cov_b, eps=1e-6):
+    dot = (cov_a * cov_b).sum(dim=(1, 2))
+    na = cov_a.pow(2).sum(dim=(1, 2)).sqrt()
+    nb = cov_b.pow(2).sum(dim=(1, 2)).sqrt()
+    return dot / (na * nb + eps)
+
+
+def modality_imbalance_loss(img_stream_feats, txt_stream_feats, img_clean_feats=None, txt_clean_feats=None, return_diagnostics=False):
+    """Loss D: modality energy-ratio and cross-modal covariance imbalance.
+
+    Larger value increases deviation from clean image/text energy balance and
+    lowers image/text covariance CKA. If clean reference is absent, falls back to
+    absolute image variance and inverse correlation proxy.
     """
     total_loss = None
-    vars_ = []
-    corrs = []
+    ratio_terms = []
+    cka_terms = []
     count = 0
 
-    for img_feat, txt_feat in zip(img_stream_feats, txt_stream_feats):
+    for idx, (img_feat, txt_feat) in enumerate(zip(img_stream_feats, txt_stream_feats)):
         if img_feat is None or txt_feat is None:
             continue
         img = img_feat.float()
         txt = txt_feat.float()
+        img_energy = img.pow(2).mean(dim=(1, 2)).clamp_min(1e-6)
+        txt_energy = txt.pow(2).mean(dim=(1, 2)).clamp_min(1e-6)
+        ratio_adv = torch.log(img_energy / txt_energy)
 
-        img_var = img.var(dim=[1, 2], unbiased=False).mean()
-        cross_corr = torch.bmm(
-            F.normalize(img, dim=-1),
-            F.normalize(txt, dim=-1).transpose(1, 2),
-        )
-        corr_abs = cross_corr.abs().mean()
-        loss = img_var + 0.1 * (1.0 - corr_abs)
+        if img_clean_feats is not None and txt_clean_feats is not None and idx < len(img_clean_feats) and idx < len(txt_clean_feats):
+            img_c = img_clean_feats[idx].float().detach()
+            txt_c = txt_clean_feats[idx].float().detach()
+            ratio_clean = torch.log(
+                img_c.pow(2).mean(dim=(1, 2)).clamp_min(1e-6)
+                / txt_c.pow(2).mean(dim=(1, 2)).clamp_min(1e-6)
+            )
+            ratio_dev = (ratio_adv - ratio_clean).pow(2).mean()
+        else:
+            ratio_dev = ratio_adv.pow(2).mean()
+
+        cov_img = _channel_cov(img)
+        cov_txt = _channel_cov(txt)
+        cka = _cov_cka(cov_img, cov_txt).mean()
+        loss = ratio_dev + 0.1 * (1.0 - cka)
 
         total_loss = loss if total_loss is None else total_loss + loss
-        vars_.append(img_var)
-        corrs.append(corr_abs)
+        ratio_terms.append(ratio_dev)
+        cka_terms.append(cka)
         count += 1
 
     if count == 0:
         device = img_stream_feats[0].device if len(img_stream_feats) > 0 and isinstance(img_stream_feats[0], torch.Tensor) else 'cpu'
         loss = torch.tensor(0.0, device=device)
-        diag = {'img_var': 0.0, 'cross_corr_abs': 0.0}
+        diag = {'modality_ratio_dev': 0.0, 'cross_modal_cka': 0.0}
         return (loss, diag) if return_diagnostics else loss
 
     loss = total_loss / count
     diag = {
-        'img_var': _tensor_item(torch.stack(vars_).mean()),
-        'cross_corr_abs': _tensor_item(torch.stack(corrs).mean()),
+        'modality_ratio_dev': _tensor_item(torch.stack(ratio_terms).mean()),
+        'cross_modal_cka': _tensor_item(torch.stack(cka_terms).mean()),
     }
     return (loss, diag) if return_diagnostics else loss
 
@@ -461,12 +502,12 @@ class SD3_Linf_PGD:
         z = (z - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
         return z.to(pipe.transformer.dtype)
 
-    def _compute_clean_features_at_timestep(self, X_clean, timestep):
+    def _compute_clean_features_at_timestep(self, X_clean, timestep, capture_attn=False):
         pipe = self.net.pipe
         hook = AttentionMapHook()
         transformer = pipe.transformer
         register_feature_hooks(
-            transformer, hook, capture_attn=False, detach_features=True,
+            transformer, hook, capture_attn=capture_attn, detach_features=True,
             capture_blocks=self.capture_blocks,
         )
         try:
@@ -479,7 +520,12 @@ class SD3_Linf_PGD:
                     pooled_projections=self.net.pooled_prompt_embeds.to(transformer.dtype),
                     return_dict=False,
                 )
-            return [f.clone().detach() for f in hook.img_stream_feats]
+            return {
+                'img': [f.clone().detach() for f in hook.img_stream_feats],
+                'txt': [f.clone().detach() if f is not None else None for f in hook.txt_stream_feats],
+                'attn': [f.clone().detach() for f in hook.attn_maps],
+                'injection': [f.clone().detach() for f in hook.txt_injection_feats],
+            }
         finally:
             hook.remove()
             restore_processors(transformer)
@@ -553,9 +599,11 @@ class SD3_Linf_PGD:
             )
 
         else:
-            feat_clean_list = None
-            if self.mmdit_mode == 'B':
-                feat_clean_list = self._compute_clean_features_at_timestep(X_clean, timestep)
+            clean_ref = None
+            if self.mmdit_mode in {'A', 'B', 'D'}:
+                clean_ref = self._compute_clean_features_at_timestep(
+                    X_clean, timestep, capture_attn=(self.mmdit_mode == 'A')
+                )
 
             hook = AttentionMapHook()
             need_attn = (self.mmdit_mode == 'A')
@@ -575,27 +623,32 @@ class SD3_Linf_PGD:
                 if self.mmdit_mode == 'A':
                     if len(hook.attn_maps) > 0:
                         mmdit_loss, diagnostics = cross_modal_disruption_loss(
-                            hook.attn_maps, return_diagnostics=True
+                            hook.attn_maps,
+                            injection_adv=hook.txt_injection_feats,
+                            injection_clean=clean_ref['injection'] if clean_ref else None,
+                            return_diagnostics=True,
                         )
                     else:
                         mmdit_loss = torch.tensor(0.0, device=device, dtype=pipe.transformer.dtype)
-                        diagnostics = {'attn_entropy': 0.0}
+                        diagnostics = {'attn_entropy': 0.0, 'attn_injection_l2': 0.0}
                 elif self.mmdit_mode == 'B':
-                    if len(hook.img_stream_feats) > 0 and feat_clean_list is not None:
+                    if len(hook.img_stream_feats) > 0 and clean_ref is not None:
                         mmdit_loss, diagnostics = feature_divergence_loss(
-                            hook.img_stream_feats, feat_clean_list, return_diagnostics=True
+                            hook.img_stream_feats, clean_ref['img'], return_diagnostics=True
                         )
                     else:
                         mmdit_loss = torch.tensor(0.0, device=device, dtype=pipe.transformer.dtype)
                         diagnostics = {'feature_cos': 0.0, 'feature_gram_l1': 0.0}
                 elif self.mmdit_mode == 'D':
-                    if len(hook.img_stream_feats) > 0 and len(hook.txt_stream_feats) > 0:
+                    if len(hook.img_stream_feats) > 0 and len(hook.txt_stream_feats) > 0 and clean_ref is not None:
                         mmdit_loss, diagnostics = modality_imbalance_loss(
-                            hook.img_stream_feats, hook.txt_stream_feats, return_diagnostics=True
+                            hook.img_stream_feats, hook.txt_stream_feats,
+                            img_clean_feats=clean_ref['img'], txt_clean_feats=clean_ref['txt'],
+                            return_diagnostics=True,
                         )
                     else:
                         mmdit_loss = torch.tensor(0.0, device=device, dtype=pipe.transformer.dtype)
-                        diagnostics = {'img_var': 0.0, 'cross_corr_abs': 0.0}
+                        diagnostics = {'modality_ratio_dev': 0.0, 'cross_modal_cka': 0.0}
                 else:
                     raise ValueError(f"Unknown SD3 MMDiT attack mode: {self.mmdit_mode}")
             finally:
