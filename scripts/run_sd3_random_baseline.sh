@@ -14,7 +14,7 @@ for EPS in "${EPS_ARR[@]}"; do
   for SEED in "${SEED_ARR[@]}"; do
     python code/metrics/random_linf_baseline.py \
       --input test_images/to_protect \
-      --output out_sd3/Random_Linf \
+      --output out_sd3 \
       --epsilon "$EPS" \
       --mode uniform \
       --seed "$SEED" \
