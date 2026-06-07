@@ -28,13 +28,22 @@ def _group_key(row, keys):
     return tuple(row.get(k, "") for k in keys)
 
 
+def _linf_threshold(row, args):
+    if args.max_linf_tensor is not None:
+        return args.max_linf_tensor
+    eps = _to_float(row.get("epsilon"))
+    if eps is None:
+        eps = args.default_epsilon
+    return 2.0 * eps / 255.0
+
+
 def _success(row, args):
     linf = _to_float(row.get("linf_perturb_tensor_-1_1"))
     lpips_perturb = _to_float(row.get("lpips_perturb"))
     lpips_edit = _to_float(row.get("lpips_edit"))
     delta_clip = _to_float(row.get("delta_clip_prompt"))
 
-    ok_linf = linf is not None and linf <= args.max_linf_tensor
+    ok_linf = linf is not None and linf <= _linf_threshold(row, args)
     ok_imp = True if lpips_perturb is None else lpips_perturb <= args.max_lpips_perturb
     ok_edit = True if lpips_edit is None else lpips_edit >= args.min_lpips_edit
     ok_clip = True if delta_clip is None else delta_clip <= -args.min_clip_drop
@@ -87,7 +96,10 @@ def main():
     parser.add_argument("--metrics", required=True)
     parser.add_argument("--out", default=None)
     parser.add_argument("--group-by", default="mode,epsilon,steps,sigma")
-    parser.add_argument("--max-linf-tensor", type=float, default=2 * 16 / 255)
+    parser.add_argument("--max-linf-tensor", type=float, default=None,
+                        help="Optional fixed Linf threshold in [-1,1] tensor space. If omitted, uses 2*epsilon/255 per row.")
+    parser.add_argument("--default-epsilon", type=float, default=16.0,
+                        help="Fallback epsilon if a row has no epsilon field.")
     parser.add_argument("--max-lpips-perturb", type=float, default=0.08)
     parser.add_argument("--min-lpips-edit", type=float, default=0.10)
     parser.add_argument("--min-clip-drop", type=float, default=0.02)
@@ -106,6 +118,8 @@ def main():
         "group_by": group_keys,
         "thresholds": {
             "max_linf_tensor": args.max_linf_tensor,
+            "default_epsilon": args.default_epsilon,
+            "linf_policy": "fixed" if args.max_linf_tensor is not None else "per_row_2epsilon_over_255",
             "max_lpips_perturb": args.max_lpips_perturb,
             "min_lpips_edit": args.min_lpips_edit,
             "min_clip_drop": args.min_clip_drop,
