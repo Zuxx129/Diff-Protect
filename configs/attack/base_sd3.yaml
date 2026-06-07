@@ -11,7 +11,13 @@ attack:
     objective_convention: larger_is_more_attack
     textual_objective: toward_target  # toward_target or away_from_target
     debug_grad: False      # Print textual/mmdit/total grad norms at first/last step
-    capture_blocks: [0, 6, 12, 17]  # Sparse MMDiT blocks for feature/attention hooks; null -> all blocks
+    capture_blocks: [0, 6, 12, 17]  # Sparse MMDiT blocks; null -> all blocks
+    seed: 0
+    run_sdedit: True
+    paired_sdedit: False   # Paired clean/adv SDEdit is planned for P1; current launcher is adv-only
+    sdedit_noise_levels: [0.1, 0.3, 0.5]
+    sdedit_steps: 28
+    low_memory: False
     use_wandb: False
     project_name: sd3_mist
     textual_weight: 1.0    # Weight for textual loss (VAE latent push)
