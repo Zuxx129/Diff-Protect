@@ -129,6 +129,18 @@ def _try_lpips(a_path: Path, b_path: Path) -> Optional[float]:
 def _parse_exp_dir(path: Path) -> Dict[str, object]:
     name = path.name
     out: Dict[str, object] = {"exp_dir": str(path), "exp_name": name}
+    if name.startswith("Random_Linf"):
+        out["mode"] = "Random_Linf"
+        m = re.search(r"eps(\d+)", name)
+        if m:
+            out["epsilon"] = m.group(1)
+        m = re.search(r"seed(\d+)", name)
+        if m:
+            out["seed"] = m.group(1)
+        m = re.search(r"Random_Linf_eps\d+_([^_]+)_seed", name)
+        if m:
+            out["random_mode"] = m.group(1)
+        return out
     patterns = {
         "mode": r"^(O_repo|O_fair|O|A|B|C|D)",
         "epsilon": r"eps(\d+)",
