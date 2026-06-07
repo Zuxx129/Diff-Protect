@@ -20,8 +20,18 @@ REQUIRED_FILES = [
     "code/diff_mist_SD3.py",
     "code/diff_mist_SD3_v2.py",
     "code/metrics/compute_sd3_metrics.py",
+    "code/metrics/aggregate_sd3_results.py",
+    "code/metrics/random_linf_baseline.py",
+    "code/metrics/compute_fid_kid.py",
+    "code/plot_loss.py",
     "scripts/collect_sd3_data.py",
     "scripts/validate_sd3_pipeline.py",
+    "scripts/run_sd3_validation.sh",
+    "scripts/run_sd3_minimal_collect.sh",
+    "scripts/run_sd3_direction_check.sh",
+    "scripts/run_sd3_full_modes.sh",
+    "scripts/run_sd3_random_baseline.sh",
+    "scripts/run_sd3_ablation_weights.sh",
 ]
 
 REQUIRED_CONFIG_KEYS = [
@@ -85,6 +95,9 @@ def check_attack_semantics(repo: Path) -> None:
         "loss = 1.0 - cos_sim.mean()",
         "_trajectory_loss_shared_noise",
         "_compute_clean_features_at_timestep",
+        "txt_injection_feats",
+        "modality_ratio_dev",
+        "cross_modal_cka",
         "grad_mmdit_l2",
         "img_to_txt_attn",
     ]
@@ -111,7 +124,31 @@ def check_entrypoints(repo: Path) -> None:
         fail("entrypoints", f"diff_mist_SD3_v2.py missing implementation markers: {missing}")
     if "code/diff_mist_SD3_v2.py" not in collect:
         fail("entrypoints", "collect_sd3_data.py must call code/diff_mist_SD3_v2.py")
+    if "--extra" not in collect:
+        fail("entrypoints", "collect_sd3_data.py must support --extra for ablation")
     print("[validate] entrypoints are wired")
+
+
+def check_experiment_tooling(repo: Path) -> None:
+    stage("experiment-tooling")
+    checks = {
+        "scripts/run_sd3_minimal_collect.sh": ["--paired-sdedit", "aggregate_sd3_results.py"],
+        "scripts/run_sd3_direction_check.sh": ["A,B,C,D", "--debug-grad"],
+        "scripts/run_sd3_full_modes.sh": ["O_repo,O_fair,A,B,C,D", "--paired-sdedit"],
+        "scripts/run_sd3_ablation_weights.sh": ["attack.textual_weight", "attack.mmdit_weight"],
+        "scripts/run_sd3_random_baseline.sh": ["random_linf_baseline.py"],
+        "code/metrics/compute_sd3_metrics.py": ["delta_clip_prompt", "loss_", "paired_sigmas"],
+        "code/metrics/aggregate_sd3_results.py": ["success_rate"],
+    }
+    missing = []
+    for rel, snippets in checks.items():
+        text = (repo / rel).read_text(encoding="utf-8")
+        for s in snippets:
+            if s not in text:
+                missing.append(f"{rel}: {s}")
+    if missing:
+        fail("experiment-tooling", f"missing snippets: {missing}")
+    print("[validate] experiment tooling is wired")
 
 
 def run_smoke(repo: Path, args: argparse.Namespace) -> None:
@@ -147,7 +184,7 @@ def main() -> None:
     args = parser.parse_args()
 
     repo = Path(args.repo).resolve()
-    for fn in [check_files, check_compile, check_config, check_attack_semantics, check_entrypoints]:
+    for fn in [check_files, check_compile, check_config, check_attack_semantics, check_entrypoints, check_experiment_tooling]:
         fn(repo)
     if args.run_smoke:
         run_smoke(repo, args)
