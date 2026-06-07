@@ -82,8 +82,10 @@ def check_attack_semantics(repo: Path) -> None:
         "larger scalar loss = stronger attack objective",
         "detach_features",
         "textual_objective",
-        "return 1.0 - cos_sim.mean()",
-        "_print_grad_debug",
+        "loss = 1.0 - cos_sim.mean()",
+        "_trajectory_loss_shared_noise",
+        "_compute_clean_features_at_timestep",
+        "grad_mmdit_l2",
         "img_to_txt_attn",
     ]
     missing = [s for s in required if s not in text]
