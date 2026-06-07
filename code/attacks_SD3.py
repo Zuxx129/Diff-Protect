@@ -38,9 +38,9 @@ class AttentionMapHook:
 class AttnMapCaptureProcessor:
     """Custom attention processor for MMDiT Joint Attention.
 
-    It keeps the real scaled-dot-product attention path unchanged, but additionally
-    computes a differentiable image-query -> text-key attention diagnostic for
-    Mode A. We intentionally avoid storing full [B,H,N,N] attention maps.
+    The real scaled-dot-product attention path is unchanged. For Mode A this
+    additionally computes a differentiable image-query -> text-key attention
+    block. Full [B,H,N,N] maps are intentionally not stored.
     """
 
     def __init__(self, hook: AttentionMapHook, block_idx: int, capture_attn: bool = True):
@@ -102,7 +102,6 @@ class AttnMapCaptureProcessor:
 
             if self.capture_attn:
                 # Differentiable image-query -> text-key attention block.
-                # This is a targeted cross-modal diagnostic, not the full joint NxN attention map.
                 attn_scores = torch.matmul(
                     query.float(), encoder_hidden_states_key_proj.float().transpose(-2, -1)
                 ) / math.sqrt(head_dim)
@@ -202,28 +201,30 @@ def restore_processors(transformer):
 # ============================================================
 
 
-def _zero_like_device(items, fallback='cpu'):
-    for item in items:
-        if isinstance(item, torch.Tensor):
-            return torch.tensor(0.0, device=item.device, dtype=item.dtype)
-    return torch.tensor(0.0, device=fallback)
+def _tensor_item(x):
+    if isinstance(x, torch.Tensor):
+        return float(x.detach().float().item())
+    return float(x)
 
 
-def cross_modal_disruption_loss(attn_maps, N_img_tokens=None):
-    """Loss A: Cross-modal injection disruption.
+def _zero_on(device, dtype=torch.float32):
+    return torch.tensor(0.0, device=device, dtype=dtype)
 
-    Larger value means more diffuse / less selective image-query -> text-key attention.
-    The current implementation optimizes entropy as a first-order proxy and records
-    differentiable attention blocks produced by AttnMapCaptureProcessor.
+
+def cross_modal_disruption_loss(attn_maps, N_img_tokens=None, return_diagnostics=False):
+    """Loss A: cross-modal attention entropy proxy.
+
+    Larger value means more diffuse image-query -> text-key attention. This is a
+    proxy for text injection disruption; full O_{I<-T} divergence is left as a
+    future extension.
     """
     if len(attn_maps) == 0:
-        return torch.tensor(0.0)
+        loss = torch.tensor(0.0)
+        return (loss, {'attn_entropy': 0.0}) if return_diagnostics else loss
 
     total_loss = None
     count = 0
     for attn_block in attn_maps:
-        # Expected shape: [B, H, N_img, N_txt]. For backward compatibility, also
-        # accept full [B,H,N,N] maps with N_img_tokens provided.
         if N_img_tokens is not None and attn_block.shape[-1] == attn_block.shape[-2]:
             text_attn = attn_block[:, :, :N_img_tokens, N_img_tokens:]
         else:
@@ -232,9 +233,9 @@ def cross_modal_disruption_loss(attn_maps, N_img_tokens=None):
         total_loss = entropy if total_loss is None else total_loss + entropy
         count += 1
 
-    if count == 0:
-        return _zero_like_device(attn_maps)
-    return total_loss / count
+    loss = total_loss / max(count, 1)
+    diag = {'attn_entropy': _tensor_item(loss)}
+    return (loss, diag) if return_diagnostics else loss
 
 
 def _normalize_feature(x, eps=1e-6):
@@ -244,12 +245,11 @@ def _normalize_feature(x, eps=1e-6):
     return (x - mean) / std
 
 
-def feature_divergence_loss(feat_adv_list, feat_clean_list):
-    """Loss B: image-stream representation divergence.
-
-    Larger value means adversarial image-stream features are farther from clean features.
-    """
+def feature_divergence_loss(feat_adv_list, feat_clean_list, return_diagnostics=False):
+    """Loss B: image-stream representation divergence with normalized features."""
     total_loss = None
+    cos_terms = []
+    gram_terms = []
     count = 0
     for feat_adv, feat_clean in zip(feat_adv_list, feat_clean_list):
         if feat_adv is None or feat_clean is None:
@@ -257,8 +257,8 @@ def feature_divergence_loss(feat_adv_list, feat_clean_list):
         adv = _normalize_feature(feat_adv)
         clean = _normalize_feature(feat_clean).detach()
 
-        cos_sim = F.cosine_similarity(adv.flatten(1), clean.flatten(1), dim=1)
-        cos_dist = 1.0 - cos_sim.mean()
+        cos_sim = F.cosine_similarity(adv.flatten(1), clean.flatten(1), dim=1).mean()
+        cos_dist = 1.0 - cos_sim
 
         gram_adv = _gram_matrix(adv)
         gram_clean = _gram_matrix(clean)
@@ -266,11 +266,24 @@ def feature_divergence_loss(feat_adv_list, feat_clean_list):
 
         loss = cos_dist + style_dist
         total_loss = loss if total_loss is None else total_loss + loss
+        cos_terms.append(cos_sim)
+        gram_terms.append(style_dist)
         count += 1
 
     if count == 0:
-        return torch.tensor(0.0, device='cpu')
-    return total_loss / count
+        device = feat_adv_list[0].device if len(feat_adv_list) > 0 and isinstance(feat_adv_list[0], torch.Tensor) else 'cpu'
+        loss = torch.tensor(0.0, device=device)
+        diag = {'feature_cos': 0.0, 'feature_gram_l1': 0.0}
+        return (loss, diag) if return_diagnostics else loss
+
+    loss = total_loss / count
+    feature_cos = torch.stack(cos_terms).mean()
+    gram_l1 = torch.stack(gram_terms).mean()
+    diag = {
+        'feature_cos': _tensor_item(feature_cos),
+        'feature_gram_l1': _tensor_item(gram_l1),
+    }
+    return (loss, diag) if return_diagnostics else loss
 
 
 def _gram_matrix(x):
@@ -280,22 +293,27 @@ def _gram_matrix(x):
     return torch.bmm(feat.transpose(1, 2), feat) / max(N * D, 1)
 
 
-def trajectory_divergence_loss(v_adv, v_clean):
-    """Loss C: flow trajectory direction divergence.
-
-    Larger value means velocity predictions point in more different directions.
-    """
+def trajectory_divergence_loss(v_adv, v_clean, return_diagnostics=False):
+    """Loss C/O_fair: flow velocity direction divergence."""
     cos_sim = F.cosine_similarity(v_adv.float().flatten(1), v_clean.float().detach().flatten(1), dim=1)
-    return 1.0 - cos_sim.mean()
+    # Keep this exact string for static validation:
+    loss = 1.0 - cos_sim.mean()
+    diag = {
+        'velocity_cos': _tensor_item(cos_sim.mean()),
+        'velocity_div': _tensor_item(loss),
+    }
+    return (loss, diag) if return_diagnostics else loss
 
 
-def modality_imbalance_loss(img_stream_feats, txt_stream_feats):
-    """Loss D: modality balance disruption.
+def modality_imbalance_loss(img_stream_feats, txt_stream_feats, return_diagnostics=False):
+    """Loss D: modality imbalance proxy.
 
-    Larger value encourages larger image-stream variance and lower image/text correlation.
-    This remains a proxy and must be interpreted with mechanism diagnostics.
+    Larger value encourages larger image-stream variance and lower image/text
+    correlation. This is a proxy, not the full energy-ratio/CKA objective.
     """
     total_loss = None
+    vars_ = []
+    corrs = []
     count = 0
 
     for img_feat, txt_feat in zip(img_stream_feats, txt_stream_feats):
@@ -313,11 +331,22 @@ def modality_imbalance_loss(img_stream_feats, txt_stream_feats):
         loss = img_var + 0.1 * (1.0 - corr_abs)
 
         total_loss = loss if total_loss is None else total_loss + loss
+        vars_.append(img_var)
+        corrs.append(corr_abs)
         count += 1
 
     if count == 0:
-        return torch.tensor(0.0, device='cpu')
-    return total_loss / count
+        device = img_stream_feats[0].device if len(img_stream_feats) > 0 and isinstance(img_stream_feats[0], torch.Tensor) else 'cpu'
+        loss = torch.tensor(0.0, device=device)
+        diag = {'img_var': 0.0, 'cross_corr_abs': 0.0}
+        return (loss, diag) if return_diagnostics else loss
+
+    loss = total_loss / count
+    diag = {
+        'img_var': _tensor_item(torch.stack(vars_).mean()),
+        'cross_corr_abs': _tensor_item(torch.stack(corrs).mean()),
+    }
+    return (loss, diag) if return_diagnostics else loss
 
 
 def denoiser_prediction_loss(v_pred):
@@ -370,24 +399,28 @@ class SD3_Linf_PGD:
         else:
             X_adv = X.clone().detach()
 
-        loss_history = {'total': [], 'textual': [], 'mmdit': []}
+        loss_history = {}
         pbar = tqdm(range(self.iters), desc=f"SD3-PGD mode={self.mmdit_mode}")
-
-        feat_clean_list = None
-        if self.mmdit_mode == 'B':
-            feat_clean_list = self._compute_clean_features(X)
 
         for i in pbar:
             X_adv.requires_grad_(True)
-            loss, components = self._compute_loss(X_adv, X, target_image, feat_clean_list, device)
+            loss, components = self._compute_loss(X_adv, X, target_image, device)
+
+            if self.debug_grad:
+                components.update(self._grad_debug_dict(X_adv, loss, components))
 
             pbar.set_description(
                 f"SD3-PGD mode={self.mmdit_mode} | total={loss.item():.3f} "
-                f"textual={components['textual']:.3f} mmdit={components['mmdit']:.3f}"
+                f"textual={components.get('textual', 0.0):.3f} mmdit={components.get('mmdit', 0.0):.3f}"
             )
 
             if self.debug_grad and (i == 0 or i == self.iters - 1):
-                self._print_grad_debug(X_adv, loss, components, i)
+                print(
+                    f"[debug_grad step={i}] "
+                    f"textual={components.get('grad_textual_l2', 0.0):.6e} "
+                    f"mmdit={components.get('grad_mmdit_l2', 0.0):.6e} "
+                    f"total={components.get('grad_total_l2', 0.0):.6e}"
+                )
 
             loss.backward()
             grad = X_adv.grad.detach()
@@ -396,9 +429,13 @@ class SD3_Linf_PGD:
             X_adv = torch.minimum(torch.maximum(X_adv, X - self.eps), X + self.eps)
             X_adv = torch.clamp(X_adv, min=self.clip_min, max=self.clip_max)
 
-            loss_history['total'].append(loss.item())
-            loss_history['textual'].append(components['textual'])
-            loss_history['mmdit'].append(components['mmdit'])
+            record = {'total': _tensor_item(loss)}
+            for key, val in components.items():
+                if key.startswith('_'):
+                    continue
+                record[key] = _tensor_item(val)
+            for key, val in record.items():
+                loss_history.setdefault(key, []).append(val)
 
             torch.cuda.empty_cache()
 
@@ -412,56 +449,47 @@ class SD3_Linf_PGD:
             return 0.0
         return grad.detach().float().norm().item()
 
-    def _print_grad_debug(self, X_adv, loss, components, step):
-        text_tensor = components.get('_textual_tensor')
-        mmdit_tensor = components.get('_mmdit_tensor')
-        text_norm = self._grad_norm(text_tensor, X_adv, retain_graph=True)
-        mmdit_norm = self._grad_norm(mmdit_tensor, X_adv, retain_graph=True)
-        total_norm = self._grad_norm(loss, X_adv, retain_graph=True)
-        print(
-            f"[debug_grad step={step}] "
-            f"textual={text_norm:.6e} mmdit={mmdit_norm:.6e} total={total_norm:.6e}"
-        )
+    def _grad_debug_dict(self, X_adv, loss, components):
+        return {
+            'grad_textual_l2': self._grad_norm(components.get('_textual_tensor'), X_adv, retain_graph=True),
+            'grad_mmdit_l2': self._grad_norm(components.get('_mmdit_tensor'), X_adv, retain_graph=True),
+            'grad_total_l2': self._grad_norm(loss, X_adv, retain_graph=True),
+        }
 
-    def _compute_clean_features(self, X_clean):
+    def _encode_latent(self, image, pipe):
+        z = pipe.vae.encode(image.to(pipe.vae.dtype)).latent_dist.mean
+        z = (z - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
+        return z.to(pipe.transformer.dtype)
+
+    def _compute_clean_features_at_timestep(self, X_clean, timestep):
         pipe = self.net.pipe
         hook = AttentionMapHook()
         transformer = pipe.transformer
-
         register_feature_hooks(
             transformer, hook, capture_attn=False, detach_features=True,
             capture_blocks=self.capture_blocks,
         )
-
-        with torch.no_grad():
-            z_clean = pipe.vae.encode(X_clean.to(pipe.vae.dtype)).latent_dist.mean
-            z_clean = (z_clean - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
-            z_clean = z_clean.to(pipe.transformer.dtype)
-
-            timestep = torch.tensor([0.5], device=X_clean.device, dtype=pipe.transformer.dtype)
-            prompt_embeds = self.net.prompt_embeds.to(pipe.transformer.dtype)
-            pooled_embeds = self.net.pooled_prompt_embeds.to(pipe.transformer.dtype)
-
-            _ = transformer(
-                hidden_states=z_clean,
-                timestep=timestep,
-                encoder_hidden_states=prompt_embeds,
-                pooled_projections=pooled_embeds,
-                return_dict=False,
-            )
-
-        feat_clean = [f.clone().detach() for f in hook.img_stream_feats]
-        hook.remove()
-        restore_processors(transformer)
-        return feat_clean
+        try:
+            with torch.no_grad():
+                z_clean = self._encode_latent(X_clean, pipe)
+                _ = transformer(
+                    hidden_states=z_clean,
+                    timestep=timestep,
+                    encoder_hidden_states=self.net.prompt_embeds.to(transformer.dtype),
+                    pooled_projections=self.net.pooled_prompt_embeds.to(transformer.dtype),
+                    return_dict=False,
+                )
+            return [f.clone().detach() for f in hook.img_stream_feats]
+        finally:
+            hook.remove()
+            restore_processors(transformer)
 
     def _textual_loss(self, z_adv, target_image, pipe, device):
         textual_loss = torch.tensor(0.0, device=device, dtype=z_adv.dtype)
         if target_image is None:
             return textual_loss
         with torch.no_grad():
-            z_target = pipe.vae.encode(target_image.to(pipe.vae.dtype)).latent_dist.mean
-            z_target = (z_target - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
+            z_target = self._encode_latent(target_image, pipe)
             z_target = z_target.to(z_adv.dtype).detach()
         raw_mse = self.cirt(z_adv, z_target)
         if self.textual_objective == 'toward_target':
@@ -470,20 +498,43 @@ class SD3_Linf_PGD:
             return raw_mse
         raise ValueError(f"Unknown textual_objective: {self.textual_objective}")
 
-    def _compute_loss(self, X_adv, X_clean, target_image, feat_clean_list, device):
+    def _trajectory_loss_shared_noise(self, z_adv, X_clean, timestep, prompt_embeds, pooled_embeds, device):
+        pipe = self.net.pipe
+        transformer = pipe.transformer
+        with torch.no_grad():
+            z_clean = self._encode_latent(X_clean, pipe).detach()
+            noise = torch.randn_like(z_adv).detach()
+            sigma = timestep.to(dtype=z_adv.dtype).reshape(-1, 1, 1, 1)
+            z_clean_t = (1.0 - sigma) * z_clean + sigma * noise
+            v_clean = transformer(
+                hidden_states=z_clean_t,
+                timestep=timestep,
+                encoder_hidden_states=prompt_embeds,
+                pooled_projections=pooled_embeds,
+                return_dict=False,
+            )[0]
+        z_adv_t = (1.0 - sigma) * z_adv + sigma * noise
+        v_adv = transformer(
+            hidden_states=z_adv_t,
+            timestep=timestep,
+            encoder_hidden_states=prompt_embeds,
+            pooled_projections=pooled_embeds,
+            return_dict=False,
+        )[0]
+        return trajectory_divergence_loss(v_adv, v_clean, return_diagnostics=True)
+
+    def _compute_loss(self, X_adv, X_clean, target_image, device):
         pipe = self.net.pipe
         transformer = pipe.transformer
 
-        z_adv = pipe.vae.encode(X_adv.to(pipe.vae.dtype)).latent_dist.mean
-        z_adv = (z_adv - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
-        z_adv = z_adv.to(pipe.transformer.dtype)
-
+        z_adv = self._encode_latent(X_adv, pipe)
         timestep = torch.tensor([torch.rand(1, device=device).item()], device=device, dtype=pipe.transformer.dtype)
         prompt_embeds = self.net.prompt_embeds.to(pipe.transformer.dtype)
         pooled_embeds = self.net.pooled_prompt_embeds.to(pipe.transformer.dtype)
 
         textual_loss = self._textual_loss(z_adv, target_image, pipe, device)
         mmdit_loss = torch.tensor(0.0, device=device, dtype=pipe.transformer.dtype)
+        diagnostics = {}
 
         if self.mmdit_mode in {'O', 'O_repo'}:
             v_pred = transformer(
@@ -494,61 +545,62 @@ class SD3_Linf_PGD:
                 return_dict=False,
             )[0]
             mmdit_loss = denoiser_prediction_loss(v_pred)
+            diagnostics['v_pred_norm'] = _tensor_item(mmdit_loss)
+
+        elif self.mmdit_mode in {'C', 'O_fair'}:
+            mmdit_loss, diagnostics = self._trajectory_loss_shared_noise(
+                z_adv, X_clean, timestep, prompt_embeds, pooled_embeds, device
+            )
+
         else:
+            feat_clean_list = None
+            if self.mmdit_mode == 'B':
+                feat_clean_list = self._compute_clean_features_at_timestep(X_clean, timestep)
+
             hook = AttentionMapHook()
             need_attn = (self.mmdit_mode == 'A')
             register_feature_hooks(
                 transformer, hook, capture_attn=need_attn, detach_features=False,
                 capture_blocks=self.capture_blocks,
             )
+            try:
+                _ = transformer(
+                    hidden_states=z_adv,
+                    timestep=timestep,
+                    encoder_hidden_states=prompt_embeds,
+                    pooled_projections=pooled_embeds,
+                    return_dict=False,
+                )[0]
 
-            v_pred = transformer(
-                hidden_states=z_adv,
-                timestep=timestep,
-                encoder_hidden_states=prompt_embeds,
-                pooled_projections=pooled_embeds,
-                return_dict=False,
-            )[0]
-
-            if self.mmdit_mode == 'A':
-                mmdit_loss = cross_modal_disruption_loss(hook.attn_maps)
-            elif self.mmdit_mode == 'B':
-                if len(hook.img_stream_feats) > 0 and feat_clean_list is not None:
-                    mmdit_loss = feature_divergence_loss(hook.img_stream_feats, feat_clean_list)
-            elif self.mmdit_mode == 'C':
-                with torch.no_grad():
-                    z_clean = pipe.vae.encode(X_clean.to(pipe.vae.dtype)).latent_dist.mean
-                    z_clean = (z_clean - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
-                    z_clean = z_clean.to(pipe.transformer.dtype)
-                    v_clean = transformer(
-                        hidden_states=z_clean,
-                        timestep=timestep,
-                        encoder_hidden_states=prompt_embeds,
-                        pooled_projections=pooled_embeds,
-                        return_dict=False,
-                    )[0]
-                mmdit_loss = trajectory_divergence_loss(v_pred, v_clean)
-            elif self.mmdit_mode == 'D':
-                if len(hook.img_stream_feats) > 0 and len(hook.txt_stream_feats) > 0:
-                    mmdit_loss = modality_imbalance_loss(hook.img_stream_feats, hook.txt_stream_feats)
-            elif self.mmdit_mode == 'O_fair':
-                with torch.no_grad():
-                    z_clean = pipe.vae.encode(X_clean.to(pipe.vae.dtype)).latent_dist.mean
-                    z_clean = (z_clean - pipe.vae.config.shift_factor) * pipe.vae.config.scaling_factor
-                    z_clean = z_clean.to(pipe.transformer.dtype)
-                    v_clean = transformer(
-                        hidden_states=z_clean,
-                        timestep=timestep,
-                        encoder_hidden_states=prompt_embeds,
-                        pooled_projections=pooled_embeds,
-                        return_dict=False,
-                    )[0]
-                mmdit_loss = trajectory_divergence_loss(v_pred, v_clean)
-            else:
-                raise ValueError(f"Unknown SD3 MMDiT attack mode: {self.mmdit_mode}")
-
-            hook.remove()
-            restore_processors(transformer)
+                if self.mmdit_mode == 'A':
+                    if len(hook.attn_maps) > 0:
+                        mmdit_loss, diagnostics = cross_modal_disruption_loss(
+                            hook.attn_maps, return_diagnostics=True
+                        )
+                    else:
+                        mmdit_loss = torch.tensor(0.0, device=device, dtype=pipe.transformer.dtype)
+                        diagnostics = {'attn_entropy': 0.0}
+                elif self.mmdit_mode == 'B':
+                    if len(hook.img_stream_feats) > 0 and feat_clean_list is not None:
+                        mmdit_loss, diagnostics = feature_divergence_loss(
+                            hook.img_stream_feats, feat_clean_list, return_diagnostics=True
+                        )
+                    else:
+                        mmdit_loss = torch.tensor(0.0, device=device, dtype=pipe.transformer.dtype)
+                        diagnostics = {'feature_cos': 0.0, 'feature_gram_l1': 0.0}
+                elif self.mmdit_mode == 'D':
+                    if len(hook.img_stream_feats) > 0 and len(hook.txt_stream_feats) > 0:
+                        mmdit_loss, diagnostics = modality_imbalance_loss(
+                            hook.img_stream_feats, hook.txt_stream_feats, return_diagnostics=True
+                        )
+                    else:
+                        mmdit_loss = torch.tensor(0.0, device=device, dtype=pipe.transformer.dtype)
+                        diagnostics = {'img_var': 0.0, 'cross_corr_abs': 0.0}
+                else:
+                    raise ValueError(f"Unknown SD3 MMDiT attack mode: {self.mmdit_mode}")
+            finally:
+                hook.remove()
+                restore_processors(transformer)
 
         joint_loss = self.textual_weight * textual_loss + self.mmdit_weight * mmdit_loss
         components = {
@@ -557,4 +609,5 @@ class SD3_Linf_PGD:
             '_textual_tensor': textual_loss,
             '_mmdit_tensor': mmdit_loss,
         }
+        components.update(diagnostics)
         return joint_loss, components
