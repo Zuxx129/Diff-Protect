@@ -2,7 +2,9 @@
 """Generate random L_inf perturbation baselines.
 
 This baseline is not an attack. It creates imperceptibility-matched random
-perturbations for thresholding and sanity comparisons.
+perturbations for thresholding and sanity comparisons. Output directories are
+written directly under --output so compute_sd3_metrics.py can parse mode,
+epsilon, and seed from the experiment directory name.
 """
 from __future__ import annotations
 
@@ -34,7 +36,7 @@ def _perturb(arr: np.ndarray, eps: int, mode: str, rng: np.random.Generator) -> 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="test_images/to_protect")
-    parser.add_argument("--output", default="out_sd3/Random_Linf")
+    parser.add_argument("--output", default="out_sd3")
     parser.add_argument("--epsilon", type=int, default=8)
     parser.add_argument("--mode", choices=["uniform", "gaussian"], default="uniform")
     parser.add_argument("--seed", type=int, default=0)
