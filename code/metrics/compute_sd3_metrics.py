@@ -163,8 +163,10 @@ def _find_samples(exp_dir: Path):
         stem = adv_path.name.replace("_attacked.png", "")
         original = _original_for(stem)
         loss_npz = adv_path.with_name(stem + "_loss.npz")
-        paired_clean = { _noise_key(p, "clean"): p for p in adv_path.parent.glob(stem + "_sdedit_clean_noise_*.png") }
-        paired_adv = { _noise_key(p, "adv"): p for p in adv_path.parent.glob(stem + "_sdedit_adv_noise_*.png") }
+        paired_clean = {_noise_key(p, "clean"): p for p in adv_path.parent.glob(stem + "_sdedit_clean_noise_*.png")}
+        paired_adv = {_noise_key(p, "adv"): p for p in adv_path.parent.glob(stem + "_sdedit_adv_noise_*.png")}
+        paired_clean.pop(None, None)
+        paired_adv.pop(None, None)
         single_adv = sorted(adv_path.parent.glob(stem + "_sdedit_noise_*.png"))
         yield stem, original, adv_path, loss_npz if loss_npz.exists() else None, paired_clean, paired_adv, single_adv
 
@@ -198,11 +200,14 @@ def _add_loss_metrics(row: Dict[str, object], loss_path: Optional[Path]) -> None
     row["loss_path"] = str(loss_path)
     try:
         data = np.load(loss_path)
-        for key in ["total", "textual", "mmdit"]:
-            if key in data and len(data[key]) > 0:
-                row[f"loss_{key}_first"] = float(data[key][0])
-                row[f"loss_{key}_final"] = float(data[key][-1])
-                row[f"loss_{key}_delta"] = float(data[key][-1] - data[key][0])
+        for key in data.files:
+            arr = np.asarray(data[key])
+            if arr.size == 0:
+                continue
+            prefix = f"loss_{key}"
+            row[f"{prefix}_first"] = float(arr.reshape(-1)[0])
+            row[f"{prefix}_final"] = float(arr.reshape(-1)[-1])
+            row[f"{prefix}_delta"] = float(arr.reshape(-1)[-1] - arr.reshape(-1)[0])
     except Exception as exc:
         row["loss_error"] = str(exc)
 
@@ -252,7 +257,8 @@ def _paired_row(base: Dict[str, object], stem: str, original_path: Optional[Path
 
 def compute_metrics(root: Path, prompt: str, enable_clip: bool, enable_lpips: bool) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
-    exp_dirs = [p for p in root.iterdir() if p.is_dir() and p.name not in {"figures", "experiment_logs", "validation_logs", "minimal_logs"}] if root.exists() else []
+    skip_dirs = {"figures", "experiment_logs", "validation_logs", "minimal_logs", "direction_logs", "full_logs"}
+    exp_dirs = [p for p in root.iterdir() if p.is_dir() and p.name not in skip_dirs] if root.exists() else []
     for exp in sorted(exp_dirs):
         base = _parse_exp_dir(exp)
         for stem, original_path, attacked_path, loss_path, clean_by_sigma, adv_by_sigma, single_adv in _find_samples(exp):
