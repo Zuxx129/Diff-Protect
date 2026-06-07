@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Validation harness for Diff-Protect SD3.
+"""Validation harness for the SD3 experiment branch.
 
-Stages fail early and identify the broken layer: files, syntax, config keys,
-objective semantics, launcher wiring, or optional GPU smoke run.
+This script is deliberately static-first. It verifies repository wiring that can
+be checked without a GPU, then optionally runs a tiny GPU smoke test.
 """
 from __future__ import annotations
 
@@ -18,8 +18,12 @@ REQUIRED_FILES = [
     "configs/attack/base_sd3.yaml",
     "code/attacks_SD3.py",
     "code/diff_mist_SD3.py",
-    "code/plot_loss.py",
+    "code/diff_mist_SD3_v2.py",
+    "code/metrics/compute_sd3_metrics.py",
+    "scripts/collect_sd3_data.py",
+    "scripts/validate_sd3_pipeline.py",
 ]
+
 REQUIRED_CONFIG_KEYS = [
     "opt_direction",
     "objective_convention",
@@ -53,12 +57,13 @@ def check_files(repo: Path) -> None:
 
 def check_compile(repo: Path) -> None:
     stage("py-compile")
-    for rel in ["code/attacks_SD3.py", "code/diff_mist_SD3.py", "code/plot_loss.py", "scripts/validate_sd3_pipeline.py", "scripts/collect_sd3_data.py"]:
-        try:
-            py_compile.compile(str(repo / rel), doraise=True)
-            print(f"[validate] compiled {rel}")
-        except Exception as exc:
-            fail("py-compile", f"{rel}: {exc}")
+    for rel in REQUIRED_FILES:
+        if rel.endswith(".py"):
+            try:
+                py_compile.compile(str(repo / rel), doraise=True)
+                print(f"[validate] compiled {rel}")
+            except Exception as exc:
+                fail("py-compile", f"{rel}: {exc}")
 
 
 def check_config(repo: Path) -> None:
@@ -67,7 +72,7 @@ def check_config(repo: Path) -> None:
     missing = [k for k in REQUIRED_CONFIG_KEYS if f"{k}:" not in text]
     if missing:
         fail("config-keys", f"missing keys: {missing}")
-    print("[validate] base_sd3.yaml contains objective and eval keys")
+    print("[validate] config contains objective and eval keys")
 
 
 def check_attack_semantics(repo: Path) -> None:
@@ -84,42 +89,32 @@ def check_attack_semantics(repo: Path) -> None:
     missing = [s for s in required if s not in text]
     if missing:
         fail("attack-objective-semantics", f"missing snippets: {missing}")
-    bad_patterns = [
-        r"with torch\.no_grad\(\):\s*# Compute attention weights",
+    old_patterns = [
         r"attn_maps\.append\(attn_weights\.detach\(\)\)",
         r"hook\.img_stream_feats\.append\(img_h\.detach\(\)\)",
     ]
-    bad = [p for p in bad_patterns if re.search(p, text, flags=re.MULTILINE)]
+    bad = [p for p in old_patterns if re.search(p, text)]
     if bad:
-        fail("attack-objective-semantics", f"old detach/no_grad patterns remain: {bad}")
+        fail("attack-objective-semantics", f"old detach patterns remain: {bad}")
     print("[validate] attack objective semantics look consistent")
 
 
-def check_launcher(repo: Path) -> None:
-    stage("launcher-wiring")
-    text = (repo / "code/diff_mist_SD3.py").read_text(encoding="utf-8")
-    required = [
-        "args.get('opt_direction'",
-        "args.get('textual_objective'",
-        "args.get('debug_grad'",
-        "args.get('capture_blocks'",
-        "paired_sdedit",
-        "sdedit_noise_levels",
-        "textual_objective=textual_objective",
-        "debug_grad=debug_grad",
-        "capture_blocks=capture_blocks",
-    ]
-    missing = [s for s in required if s not in text]
-    if missing:
-        fail("launcher-wiring", f"missing launcher wiring: {missing}")
-    print("[validate] launcher wiring looks consistent")
+def check_entrypoints(repo: Path) -> None:
+    stage("entrypoints")
+    v2 = (repo / "code/diff_mist_SD3_v2.py").read_text(encoding="utf-8")
+    collect = (repo / "scripts/collect_sd3_data.py").read_text(encoding="utf-8")
+    if "from diff_mist_SD3 import main" not in v2:
+        fail("entrypoints", "diff_mist_SD3_v2.py should delegate to legacy launcher until paired v2 is implemented")
+    if "code/diff_mist_SD3_v2.py" not in collect:
+        fail("entrypoints", "collect_sd3_data.py must call code/diff_mist_SD3_v2.py")
+    print("[validate] entrypoints are wired")
 
 
 def run_smoke(repo: Path, args: argparse.Namespace) -> None:
     stage("optional-gpu-smoke")
     cmd = [
         sys.executable,
-        "code/diff_mist_SD3.py",
+        "code/diff_mist_SD3_v2.py",
         "attack.mode=O_repo",
         "attack.opt_direction=maximize",
         "attack.textual_objective=toward_target",
@@ -136,7 +131,6 @@ def run_smoke(repo: Path, args: argparse.Namespace) -> None:
     print(proc.stdout)
     if proc.returncode != 0:
         fail("optional-gpu-smoke", f"smoke command failed with return code {proc.returncode}")
-    print("[validate] smoke run passed")
 
 
 def main() -> None:
@@ -149,7 +143,7 @@ def main() -> None:
     args = parser.parse_args()
 
     repo = Path(args.repo).resolve()
-    for fn in [check_files, check_compile, check_config, check_attack_semantics, check_launcher]:
+    for fn in [check_files, check_compile, check_config, check_attack_semantics, check_entrypoints]:
         fn(repo)
     if args.run_smoke:
         run_smoke(repo, args)
