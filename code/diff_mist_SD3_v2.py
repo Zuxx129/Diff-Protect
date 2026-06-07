@@ -17,7 +17,7 @@ from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from tqdm import tqdm
 
-from attacks_SD3 import SD3_Linf_PGD
+from attacks_SD3_v2 import SD3_Linf_PGD
 from diff_mist_SD3 import SD3_target_model, identity_loss, load_image_from_path, _denoise_from_noise_level
 from utils import mp, cprint
 
