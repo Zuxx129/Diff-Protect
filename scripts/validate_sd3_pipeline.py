@@ -17,12 +17,14 @@ from pathlib import Path
 REQUIRED_FILES = [
     "configs/attack/base_sd3.yaml",
     "code/attacks_SD3.py",
+    "code/attacks_SD3_v2.py",
     "code/diff_mist_SD3.py",
     "code/diff_mist_SD3_v2.py",
     "code/metrics/compute_sd3_metrics.py",
     "code/metrics/aggregate_sd3_results.py",
     "code/metrics/random_linf_baseline.py",
     "code/metrics/compute_fid_kid.py",
+    "code/metrics/plot_sd3_paper_figures.py",
     "code/plot_loss.py",
     "scripts/collect_sd3_data.py",
     "scripts/validate_sd3_pipeline.py",
@@ -104,6 +106,11 @@ def check_attack_semantics(repo: Path) -> None:
     missing = [s for s in required if s not in text]
     if missing:
         fail("attack-objective-semantics", f"missing snippets: {missing}")
+    wrapper = (repo / "code/attacks_SD3_v2.py").read_text(encoding="utf-8")
+    wrapper_required = ["O_fair", "raw clean/adv latent velocity", "_raw_velocity_baseline_loss"]
+    missing_wrapper = [s for s in wrapper_required if s not in wrapper]
+    if missing_wrapper:
+        fail("attack-objective-semantics", f"O_fair wrapper missing snippets: {missing_wrapper}")
     old_patterns = [
         r"attn_maps\.append\(attn_weights\.detach\(\)\)",
         r"hook\.img_stream_feats\.append\(img_h\.detach\(\)\)",
@@ -118,14 +125,15 @@ def check_entrypoints(repo: Path) -> None:
     stage("entrypoints")
     v2 = (repo / "code/diff_mist_SD3_v2.py").read_text(encoding="utf-8")
     collect = (repo / "scripts/collect_sd3_data.py").read_text(encoding="utf-8")
-    required_v2 = ["infer_v2", "_run_sdedit_pair", "paired_sdedit", "SD3_Linf_PGD"]
+    required_v2 = ["from attacks_SD3_v2 import SD3_Linf_PGD", "infer_v2", "_run_sdedit_pair", "paired_sdedit", "SD3_Linf_PGD"]
     missing = [s for s in required_v2 if s not in v2]
     if missing:
         fail("entrypoints", f"diff_mist_SD3_v2.py missing implementation markers: {missing}")
     if "code/diff_mist_SD3_v2.py" not in collect:
         fail("entrypoints", "collect_sd3_data.py must call code/diff_mist_SD3_v2.py")
-    if "--extra" not in collect:
-        fail("entrypoints", "collect_sd3_data.py must support --extra for ablation")
+    for snippet in ["--extra", "--only-modes", "--exclude-modes", "--skip-existing", "--continue-on-fail", "--start-index", "--end-index"]:
+        if snippet not in collect:
+            fail("entrypoints", f"collect_sd3_data.py missing {snippet}")
     print("[validate] entrypoints are wired")
 
 
@@ -134,11 +142,12 @@ def check_experiment_tooling(repo: Path) -> None:
     checks = {
         "scripts/run_sd3_minimal_collect.sh": ["--paired-sdedit", "aggregate_sd3_results.py"],
         "scripts/run_sd3_direction_check.sh": ["A,B,C,D", "--debug-grad"],
-        "scripts/run_sd3_full_modes.sh": ["O_repo,O_fair,A,B,C,D", "--paired-sdedit"],
+        "scripts/run_sd3_full_modes.sh": ["O_repo,O_fair,A,B,C,D", "--paired-sdedit", "compute_fid_kid.py", "plot_sd3_paper_figures.py", "--skip-existing"],
         "scripts/run_sd3_ablation_weights.sh": ["attack.textual_weight", "attack.mmdit_weight"],
-        "scripts/run_sd3_random_baseline.sh": ["random_linf_baseline.py"],
-        "code/metrics/compute_sd3_metrics.py": ["delta_clip_prompt", "loss_", "paired_sigmas"],
-        "code/metrics/aggregate_sd3_results.py": ["success_rate"],
+        "scripts/run_sd3_random_baseline.sh": ["random_linf_baseline.py", "--output out_sd3"],
+        "code/metrics/compute_sd3_metrics.py": ["delta_clip_prompt", "loss_", "paired_sigmas", "Random_Linf"],
+        "code/metrics/aggregate_sd3_results.py": ["success_rate", "per_row_2epsilon_over_255"],
+        "code/metrics/plot_sd3_paper_figures.py": ["success_rate_vs_epsilon", "mechanism_"],
     }
     missing = []
     for rel, snippets in checks.items():
