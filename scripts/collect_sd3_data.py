@@ -22,8 +22,14 @@ def _split_csv(value: str) -> List[str]:
     return [x.strip() for x in str(value).split(",") if x.strip()]
 
 
+def _extra_overrides(value: str) -> List[str]:
+    if not value:
+        return []
+    return _split_csv(value)
+
+
 def _build_command(args, mode: str, epsilon: str, steps: str, seed: str) -> List[str]:
-    return [
+    cmd = [
         sys.executable,
         args.entrypoint,
         f"attack.mode={mode}",
@@ -41,6 +47,8 @@ def _build_command(args, mode: str, epsilon: str, steps: str, seed: str) -> List
         f"attack.sdedit_steps={args.sdedit_steps}",
         f"attack.output_path={args.output_path}",
     ]
+    cmd.extend(_extra_overrides(args.extra))
+    return cmd
 
 
 def _run_one(repo: Path, cmd: List[str], log_path: Path, dry_run: bool) -> int:
@@ -74,6 +82,7 @@ def main() -> None:
     parser.add_argument("--paired-sdedit", action="store_true")
     parser.add_argument("--sdedit-steps", type=int, default=28)
     parser.add_argument("--debug-grad", action="store_true")
+    parser.add_argument("--extra", default="", help="Comma-separated additional Hydra overrides, e.g. attack.textual_weight=1.0,attack.mmdit_weight=2.0")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--stop-on-fail", action="store_true")
     args = parser.parse_args()
