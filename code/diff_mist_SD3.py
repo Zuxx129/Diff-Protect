@@ -6,12 +6,13 @@
 #   python code/diff_mist_SD3.py attack.mode='A' attack.g_mode='+' attack.device="cuda:2"
 #   python code/diff_mist_SD3.py attack.mode='B' attack.g_mode='-' attack.device="cuda:1"
 #   python code/diff_mist_SD3.py attack.mode='C' attack.g_mode='+' attack.device="cuda:2"
-#   python code/diff_mist_SD3.py attack.mode='D' attack.g_mode='-' attack.device="cuda:1"
+#   python code/diff_mist_SD3.py attack.mode='D' attack.g_mode='+' attack.device="cuda:1"
 #
 # Modes:
-#   O: Textural Loss + Semantic Loss (纹理损失+语义损失，作为基线)
-#      - Textural: Maximize VAE latent distance from target
-#      - Semantic: Maximize denoiser prediction magnitude
+#   O/O_repo: Textural Loss + Semantic Loss (repository baseline)
+#      - Textual: configured by attack.textual_objective
+#      - Semantic: maximize denoiser prediction magnitude
+#   O_fair: velocity-divergence baseline without MMDiT hooks
 #   A: Cross-Modal Alignment Disruption (破坏跨模态对齐)
 #   B: Attention Feature Shift (特征偏移)
 #   C: Temporal Consistency Break (时序一致性破坏)
@@ -307,6 +308,8 @@ class SD3_target_model(nn.Module):
 
 def init(epsilon: int = 16, steps: int = 100, alpha: int = 1,
          input_size: int = 512, mode: str = 'A', g_mode: str = '+',
+         opt_direction: str = None, textual_objective: str = 'toward_target',
+         debug_grad: bool = False, capture_blocks=None,
          device: str = "cuda:0", input_prompt: str = 'a photo',
          textual_weight: float = 1.0, mmdit_weight: float = 1.0,
          model_name: str = "stabilityai/stable-diffusion-3.5-medium"):
@@ -363,6 +366,10 @@ def init(epsilon: int = 16, steps: int = 100, alpha: int = 1,
         'input_size': input_size,
         'mode': mode,
         'g_mode': g_mode,
+        'opt_direction': opt_direction or ('maximize' if g_mode == '+' else 'minimize'),
+        'textual_objective': textual_objective,
+        'debug_grad': debug_grad,
+        'capture_blocks': capture_blocks,
         'textual_weight': textual_weight,
         'mmdit_weight': mmdit_weight,
     }
@@ -391,11 +398,15 @@ def infer(img: PIL.Image.Image, config, tar_img: PIL.Image.Image = None,
     steps = parameters['steps']
     input_size = parameters['input_size']
     g_mode = parameters['g_mode']
+    opt_direction = parameters.get('opt_direction', 'maximize' if g_mode == '+' else 'minimize')
+    textual_objective = parameters.get('textual_objective', 'toward_target')
+    debug_grad = parameters.get('debug_grad', False)
+    capture_blocks = parameters.get('capture_blocks', None)
     textual_weight = parameters['textual_weight']
     mmdit_weight = parameters['mmdit_weight']
 
     cprint(f'epsilon: {epsilon}', 'y')
-    cprint(f'mode: {mode}, g_mode: {g_mode}', 'y')
+    cprint(f'mode: {mode}, g_mode: {g_mode}, opt_direction: {opt_direction}, textual_objective: {textual_objective}', 'y')
 
     # Preprocess image to [-1, 1] range
     img = img.convert('RGB')
@@ -447,10 +458,14 @@ def infer(img: PIL.Image.Image, config, tar_img: PIL.Image.Image = None,
         clip_max=1.0,
         targeted=True,
         g_mode=g_mode,
+        opt_direction=opt_direction,
         mmdit_mode=mode,
         capture_attn=(mode == 'A'),
         textual_weight=textual_weight,
         mmdit_weight=mmdit_weight,
+        textual_objective=textual_objective,
+        debug_grad=debug_grad,
+        capture_blocks=capture_blocks,
     )
 
     attack_output, loss_history = attack.pgd_sd3(
@@ -558,7 +573,7 @@ def _denoise_from_noise_level(pipe, z_noisy, prompt_embeds, pooled_embeds,
             hidden_states=latents,
             timestep=timestep,
             encoder_hidden_states=prompt_embeds.to(pipe.transformer.dtype),
-            pooled_projections=pooled_embeds.to(pipe.transformer.dtype),
+            pooled_projections=pooled_embeds,
             return_dict=False,
         )[0]
         latents = pipe.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
@@ -585,6 +600,10 @@ def main(cfg: DictConfig):
     mode = args.mode
     alpha = args.alpha
     g_mode = args.g_mode
+    opt_direction = args.get('opt_direction', 'maximize' if g_mode == '+' else 'minimize')
+    textual_objective = args.get('textual_objective', 'toward_target')
+    debug_grad = args.get('debug_grad', False)
+    capture_blocks = args.get('capture_blocks', None)
     output_path = args.output_path
     img_path = args.img_path
     device = args.device
@@ -598,8 +617,8 @@ def main(cfg: DictConfig):
     elif isinstance(device, str) and device.isdigit():
         device = f"cuda:{device}"
 
-    mode_name = f'{mode}_eps{epsilon}_steps{steps}_gmode{g_mode}'
-    mode_name += f'_tw{textual_weight}_mw{mmdit_weight}'
+    mode_name = f'{mode}_eps{epsilon}_steps{steps}_gmode{g_mode}_opt{opt_direction}'
+    mode_name += f'_text{textual_objective}_tw{textual_weight}_mw{mmdit_weight}'
 
     output_path = output_path + f'/{mode_name}/'
     mp(output_path)
@@ -619,7 +638,9 @@ def main(cfg: DictConfig):
     # Initialize
     config = init(
         epsilon=epsilon, alpha=alpha, steps=steps,
-        mode=mode, g_mode=g_mode, device=device,
+        mode=mode, g_mode=g_mode, opt_direction=opt_direction,
+        textual_objective=textual_objective, debug_grad=debug_grad,
+        capture_blocks=capture_blocks, device=device,
         input_prompt=input_prompt,
         textual_weight=textual_weight,
         mmdit_weight=mmdit_weight,

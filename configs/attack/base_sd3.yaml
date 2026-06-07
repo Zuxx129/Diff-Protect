@@ -2,11 +2,16 @@ attack:
     epsilon: 16
     steps: 100
     input_size: 1024
-    mode: A               # MMDiT attack mode: O/A/B/C/D
+    mode: A               # MMDiT attack mode: O/O_repo/O_fair/A/B/C/D
     img_path: test_images/to_protect
     output_path: out_sd3/
     alpha: 1
-    g_mode: "+"            # Gradient direction: '+' (maximize) or '-' (minimize)
+    g_mode: "+"            # Backward-compatible: '+' -> maximize, '-' -> minimize
+    opt_direction: maximize # Preferred objective direction: maximize or minimize
+    objective_convention: larger_is_more_attack
+    textual_objective: toward_target  # toward_target or away_from_target
+    debug_grad: False      # Print textual/mmdit/total grad norms at first/last step
+    capture_blocks: [0, 6, 12, 17]  # Sparse MMDiT blocks for feature/attention hooks; null -> all blocks
     use_wandb: False
     project_name: sd3_mist
     textual_weight: 1.0    # Weight for textual loss (VAE latent push)
