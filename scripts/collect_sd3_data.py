@@ -25,7 +25,7 @@ def _split_csv(value: str) -> List[str]:
 def _build_command(args, mode: str, epsilon: str, steps: str, seed: str) -> List[str]:
     return [
         sys.executable,
-        "code/diff_mist_SD3.py",
+        args.entrypoint,
         f"attack.mode={mode}",
         f"attack.epsilon={epsilon}",
         f"attack.steps={steps}",
@@ -58,6 +58,7 @@ def _run_one(repo: Path, cmd: List[str], log_path: Path, dry_run: bool) -> int:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", default=".")
+    parser.add_argument("--entrypoint", default="code/diff_mist_SD3_v2.py")
     parser.add_argument("--modes", default="O_repo,C")
     parser.add_argument("--epsilons", default="8")
     parser.add_argument("--steps", default="2")
@@ -78,7 +79,13 @@ def main() -> None:
     args = parser.parse_args()
 
     repo = Path(args.repo).resolve()
+    entrypoint = repo / args.entrypoint
+    if not entrypoint.exists():
+        raise FileNotFoundError(f"entrypoint not found: {entrypoint}")
+
     log_root = Path(args.log_root)
+    if not log_root.is_absolute():
+        log_root = repo / log_root
     log_root.mkdir(parents=True, exist_ok=True)
     manifest_path = log_root / "manifest.csv"
 
