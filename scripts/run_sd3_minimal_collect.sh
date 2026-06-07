@@ -18,12 +18,19 @@ python scripts/collect_sd3_data.py \
   --opt-direction maximize \
   --textual-objective toward_target \
   --debug-grad \
+  --run-sdedit \
+  --paired-sdedit \
+  --sdedit-steps 8 \
   --output-path out_sd3/ \
   --log-root out_sd3/minimal_logs
 
 python code/metrics/compute_sd3_metrics.py \
   --root out_sd3 \
   --out out_sd3/minimal_metrics.csv
+
+python code/metrics/aggregate_sd3_results.py \
+  --metrics out_sd3/minimal_metrics.csv \
+  --out out_sd3/minimal_summary.csv || true
 
 python code/plot_loss.py \
   --root out_sd3 \
