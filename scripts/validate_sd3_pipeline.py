@@ -103,8 +103,10 @@ def check_entrypoints(repo: Path) -> None:
     stage("entrypoints")
     v2 = (repo / "code/diff_mist_SD3_v2.py").read_text(encoding="utf-8")
     collect = (repo / "scripts/collect_sd3_data.py").read_text(encoding="utf-8")
-    if "from diff_mist_SD3 import main" not in v2:
-        fail("entrypoints", "diff_mist_SD3_v2.py should delegate to legacy launcher until paired v2 is implemented")
+    required_v2 = ["infer_v2", "_run_sdedit_pair", "paired_sdedit", "SD3_Linf_PGD"]
+    missing = [s for s in required_v2 if s not in v2]
+    if missing:
+        fail("entrypoints", f"diff_mist_SD3_v2.py missing implementation markers: {missing}")
     if "code/diff_mist_SD3_v2.py" not in collect:
         fail("entrypoints", "collect_sd3_data.py must call code/diff_mist_SD3_v2.py")
     print("[validate] entrypoints are wired")
