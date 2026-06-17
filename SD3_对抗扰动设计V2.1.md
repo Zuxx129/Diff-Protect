@@ -11,7 +11,7 @@
 V2.1 不再把 A/B/C/D 写成松散的四个 loss，而是将它们统一为一个白盒、结构感知、可诊断的 $L_\infty$ 约束优化问题：
 
 $$
-\max_{\lVert \delta \rVert_\infty\le \epsilon}
+\max_{\lVert_\delta \rVert_\infty\le \epsilon}
 L_{\mathrm{attack}}(x+\delta,c;\theta),
 \quad
 x_{adv}=\operatorname{clip}(x+\delta,-1,1),
@@ -261,11 +261,12 @@ $$
 V2.1 使用：
 
 $$
-L_A=rac{1}{|\mathcal B|}
+L_A=\frac{1}{|\mathcal B|}
 \sum_{l\in\mathcal B}
 \frac{\lVert O_{adv}^{(l)}-\operatorname{sg}(O_{clean}^{(l)})\rVert_2^2}
 {\operatorname{sg}(\lVert O_{clean}^{(l)}\rVert_2^2)+\eta}
-+ho_A H(A_{adv}^{(l)}),
++
+ho_A H(A_{adv}^{(l)}),
 $$
 
 其中 $\operatorname{sg}$ 为 stop-gradient，$H$ 是 attention entropy，当前实现中 $\rho_A=0.05$。
@@ -308,7 +309,7 @@ $$
 V2.1 loss：
 
 $$
-L_B=rac{1}{|\mathcal B|}\sum_{l\in\mathcal B}
+L_B=\frac{1}{|\mathcal B|}\sum_{l\in\mathcal B}
 \left(1-\cos(\widehat F_{adv}^{(l)},\operatorname{sg}(\widehat F_{clean}^{(l)}))\right)
 +\rho_B\lVert G(\widehat F_{adv}^{(l)})-\operatorname{sg}(G(\widehat F_{clean}^{(l)}))\rVert_1.
 $$

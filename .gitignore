@@ -1,6 +1,7 @@
 ckpt/
 outputs/
 hub/
+out_sd3/
 
 __pycache__
 *.py[cod]
