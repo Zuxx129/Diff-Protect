@@ -53,7 +53,10 @@ def _ssim_fallback(a: np.ndarray, b: np.ndarray) -> Optional[float]:
         from skimage.metrics import structural_similarity as ssim
     except Exception:
         return None
-    return float(ssim(a, b, channel_axis=2, data_range=1.0))
+    try:
+        return float(ssim(a, b, channel_axis=2, data_range=1.0))
+    except Exception:
+        return None
 
 
 _CLIP_MODEL = None
@@ -142,18 +145,25 @@ def _parse_exp_dir(path: Path) -> Dict[str, object]:
             out["random_mode"] = m.group(1)
         return out
     patterns = {
-        "mode": r"^(O_repo|O_fair|O|A|B|C|D)",
+        "mode": r"^(textual_only|FMP_single_plus_step|FMP_single|FMP_multi|textual_semantic_joint|O_repo|O_fair|E|O|A|B|C|D)",
         "epsilon": r"eps(\d+)",
         "steps": r"steps(\d+)",
         "g_mode": r"gmode([+-])",
         "opt_direction": r"opt(maximize|minimize)",
-        "textual_objective": r"text([^_]+)",
+        "textual_objective": r"_text(.+?)(?:_tw|_mw|_seed|$)",
+        "random_start": r"rs(true|false)",
         "seed": r"seed(\d+)",
     }
     for key, pattern in patterns.items():
         m = re.search(pattern, name)
         if m:
             out[key] = m.group(1)
+    if out.get("mode") == "O_repo":
+        out["mode"] = "O_repo_legacy"
+    elif out.get("mode") == "O_fair":
+        out["mode"] = "O_fair_legacy"
+    elif out.get("mode") == "textual_semantic_joint":
+        out["mode"] = "textual_semantic_joint_legacy"
     return out
 
 
@@ -216,7 +226,7 @@ def _add_loss_metrics(row: Dict[str, object], loss_path: Optional[Path]) -> None
             arr = np.asarray(data[key])
             if arr.size == 0:
                 continue
-            prefix = f"loss_{key}"
+            prefix = key if str(key).startswith("loss_") else f"loss_{key}"
             row[f"{prefix}_first"] = float(arr.reshape(-1)[0])
             row[f"{prefix}_final"] = float(arr.reshape(-1)[-1])
             row[f"{prefix}_delta"] = float(arr.reshape(-1)[-1] - arr.reshape(-1)[0])
@@ -269,7 +279,19 @@ def _paired_row(base: Dict[str, object], stem: str, original_path: Optional[Path
 
 def compute_metrics(root: Path, prompt: str, enable_clip: bool, enable_lpips: bool) -> List[Dict[str, object]]:
     rows: List[Dict[str, object]] = []
-    skip_dirs = {"figures", "experiment_logs", "validation_logs", "minimal_logs", "direction_logs", "full_logs"}
+    skip_dirs = {
+        "figures",
+        "paper_figures",
+        "analysis",
+        "experiment_logs",
+        "validation_logs",
+        "minimal_logs",
+        "minimal_rs_false_logs",
+        "minimal_rs_true_logs",
+        "direction_logs",
+        "full_logs",
+        "step_ablation_logs",
+    }
     exp_dirs = [p for p in root.iterdir() if p.is_dir() and p.name not in skip_dirs] if root.exists() else []
     for exp in sorted(exp_dirs):
         base = _parse_exp_dir(exp)

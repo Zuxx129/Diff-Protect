@@ -2,6 +2,9 @@ import torch
 from transformers import CLIPImageProcessor, CLIPModel, CLIPTokenizer
 from PIL import Image
 
+import os
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
 # Load the CLIP model
 model_ID = "openai/clip-vit-base-patch32"
 model = CLIPModel.from_pretrained(model_ID)

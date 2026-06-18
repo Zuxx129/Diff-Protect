@@ -6,3 +6,6 @@ out_sd3/
 __pycache__
 *.py[cod]
 *.sw[pon]
+
+run_sd3_ablation_weights.log
+run_sd3_full_modes.log
