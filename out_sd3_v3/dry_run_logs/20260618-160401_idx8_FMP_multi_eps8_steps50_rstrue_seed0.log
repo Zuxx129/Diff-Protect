@@ -1,3 +1,0 @@
-COMMAND: D:\anaconda3\python.exe code/diff_mist_SD3_v3.py attack.mode=FMP_multi attack.epsilon=8 attack.steps=50 attack.seed=0 attack.input_size=512 attack.device=cuda:0 attack.max_exp_num=1 attack.opt_direction=maximize attack.random_start=true attack.textual_weight=1.0 attack.mmdit_weight=100000.0 attack.fmp_sigma_levels=[0.1,0.3,0.5] attack.fmp_multi_reduce=mean attack.fmp_target_convention=noise_minus_data attack.use_step_loss=false attack.lambda_step=1.0 attack.run_sdedit=false attack.paired_sdedit=false attack.sdedit_noise_levels=[0.1,0.3,0.5] attack.sdedit_steps=28 attack.output_path=out_sd3_v3/ attack.debug_grad=false
-
-DRY RUN: command not executed
